@@ -4,8 +4,6 @@ env:
   OUT_DIR: "out"
   KERNEL_VERSION: "5.15"
   ANDROID_VERSION: "13"
-  SUSFS_BRANCH: "gki-android13-5.15"
-  SUSFS_REPO: "https://gitlab.com/simonpunk/susfs4ksu.git"
 
 on:
   workflow_dispatch:
@@ -31,25 +29,28 @@ on:
         type: string
         default: ""
       buildKSU:
-        description: "Which root variants to build?"
+        description: "Build KSU variant?"
         required: true
         type: choice
-        default: "all"
+        default: "both"
         options:
           - "noksu"
+          - "ksu"
+          - "both"
+      ksuFlavor:
+        description: "Which KSU to use for the 'ksu' variant"
+        required: true
+        type: choice
+        default: "apkesu"
+        options:
           - "wildksu"
           - "apkesu"
-          - "all"
       apkeSuRef:
-        description: "ApkeSU branch/tag/commit (apkesu variant)"
+        description: "ApkeSU branch/tag/commit (apkesu flavor)"
         required: false
         type: string
         default: "ApkeSU"
-      wildKsuRef:
-        description: "Wild KSU branch/tag (wildksu variant)"
-        required: false
-        type: string
-        default: "canary"
+
       tickRate:
         description: "Kernel tick rate (Hz)"
         required: false
@@ -95,9 +96,8 @@ jobs:
     strategy:
       matrix:
         variant: ${{ fromJSON(
-          inputs.buildKSU == 'all' && '["noksu", "wildksu", "apkesu"]' ||
-          inputs.buildKSU == 'wildksu' && '["wildksu"]' ||
-          inputs.buildKSU == 'apkesu' && '["apkesu"]' ||
+          inputs.buildKSU == 'both' && '["noksu", "ksu"]' ||
+          inputs.buildKSU == 'ksu' && '["ksu"]' ||
           '["noksu"]' ) }}
     env:
       kernelDir: common_${{ github.event.inputs.kernelDevice }}
@@ -123,18 +123,6 @@ jobs:
         run: |
           git clone --recursive --branch ${{ github.event.inputs.kernelBranch }} \
             ${{ github.event.inputs.kernelSourceURL }} ${{ env.kernelName }} --depth=1
-
-      - name: "🩹 Fix broken source repository"
-        working-directory: ./${{ env.kernelDir }}/${{ env.kernelName }}
-        run: |
-          echo "Checking if the source repo has broken SUSFS commits..."
-          if grep -q "FR_INTR_QUEUED" fs/fuse/dev.c && ! grep -q "FR_INTR_QUEUED" fs/fuse/fuse_i.h; then
-            echo "🔧 Fixing broken fuse_i.h for ALL versions (noksu & ksu)..."
-            sed -i 's/FR_PENDING,/FR_PENDING,\n\tFR_INTR_QUEUED,/g' fs/fuse/fuse_i.h
-          fi
-          
-          echo "🔧 Replacing undefined dprintk with pr_debug in FUSE..."
-          sed -i 's/dprintk/pr_debug/g' fs/fuse/*.c
 
       - name: "📥 Initialize repo"
         if: github.event.inputs.buildToolchains == 'android-tools'
@@ -182,22 +170,34 @@ jobs:
       - name: "💫 Get Toolchains"
         if: github.event.inputs.buildToolchains == 'custom-tools'
         run: |
-          set -e
+          set -e  # Exit on errors
+      
+          # Function to fetch latest release tar.gz URL from GitHub
           get_latest_github_release() {
             local repo_url="$1"
             latest_url=$(curl -sL "https://api.github.com/repos/$repo_url/releases/latest" | grep "browser_download_url.*tar.gz" | cut -d '"' -f 4 | head -n 1)
+            
             if [[ -z "$latest_url" ]]; then
               echo "❌ Failed to fetch latest release from $repo_url!"
               exit 1
             fi
-            printf "%s" "$latest_url"
+      
+            printf "%s" "$latest_url"  # Use printf to output only the URL
           }
+      
           clang_url=$(get_latest_github_release "greenforce-project/greenforce_clang")
+      
           echo "✅ Clang URL: $clang_url"
+      
+          # Create clang directory
           mkdir -p clang
+      
+          # Check if it's an archive or a Git repo
           if [[ "$clang_url" == *.tar.gz ]]; then
             echo "🚀 Downloading latest Clang from: $clang_url..."
             wget --progress=bar:force -O "clang/clang.tar.gz" "$clang_url" || { echo "❌ Failed to download Clang!"; exit 1; }
+      
+            # Extract Clang
             echo "📦 Extracting Clang..."
             tar -xf clang/clang.tar.gz -C clang || { echo "❌ Extraction failed!"; exit 1; }
             rm -f clang/clang.tar.gz
@@ -205,20 +205,26 @@ jobs:
             echo "🚀 Cloning Clang from $clang_url..."
             git clone --recursive --depth=1 "$clang_url" clang || { echo "❌ Cloning failed!"; exit 1; }
           fi
+      
+          # Find Clang's bin directory
           if [ -d "clang/bin" ]; then
             CLANG_PATH="${{ github.workspace }}/clang/bin"
           else
             CLANG_PATH=$(find clang -type d -name "bin" | head -n 1)
             CLANG_PATH="${{ github.workspace }}/${CLANG_PATH}"
           fi
+      
+          # Ensure Clang binary exists
           if [ ! -f "$CLANG_PATH/clang" ]; then
             echo "❌ Clang binary not found in $CLANG_PATH! Build might fail."
-            ls -R clang
+            ls -R clang  # Debugging: Show extracted files
             exit 1
           fi
+      
           echo "✅ Using Clang from $CLANG_PATH"
           echo "CLANG_PATH=$CLANG_PATH" >> $GITHUB_ENV
-          echo "$CLANG_PATH" >> $GITHUB_PATH
+          echo "$CLANG_PATH" >> $GITHUB_PATH  # Ensures path is updated
+      
           export PATH="$CLANG_PATH:$PATH"
           export CLANG_TRIPLE="aarch64-linux-gnu-"
           export CC=clang
@@ -228,6 +234,7 @@ jobs:
           export OBJCOPY="llvm-objcopy"
           export OBJDUMP="llvm-objdump"
           export STRIP="llvm-strip"
+      
           echo "⚙️ Using Clang version:"
           clang --version || echo "❌ Clang not found in PATH!"
 
@@ -266,23 +273,22 @@ jobs:
          echo 'KBUILD_CFLAGS += -Wno-implicit-function-declaration' >> Makefile
          echo 'KBUILD_CFLAGS += -Wno-sometimes-uninitialized' >> Makefile
          echo "Custom Makefile line added successfully"
-
-      - name: "🔧 Apply DroidSpaces kABI Fixes"
-        working-directory: ./${{ env.kernelDir }}/${{ env.kernelName }}
-        run: |
-          echo "📦 Downloading DroidSpaces SYSVIPC kABI patch for GKI 5.15..."
-          curl -LSsO "https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kABI_6_7_8.patch"
-          echo "🔧 Applying kABI patch..."
-          patch -p1 < 001.GKI-below-6.12-fix_sysvipc_kABI_6_7_8.patch || echo "⚠️ Warning: kABI patch failed or already applied"
     
       - name: "⚙️ Configure kernel"
         working-directory: ./${{ env.kernelDir }}/${{ env.kernelName }}
         run: |
+         # Define the config file path
          CONFIG_FILE="arch/arm64/configs/${{ env.DEFCONFIG_NAME }}"
+    
+         # Remove any existing LTO FULL configuration
          sed -i '/^CONFIG_LTO_CLANG_FULL/d' "$CONFIG_FILE"
+    
+         # Set localversion
          if [ -n "${{ github.event.inputs.localVersion }}" ]; then
           echo "CONFIG_LOCALVERSION=\"${{ github.event.inputs.localVersion }}\"" >> "$CONFIG_FILE"
          fi
+    
+         # LTO Configuration - Enable Thin LTO only
          if [ "${{ github.event.inputs.LtoOptimizations }}" = "thin" ]; then
            sed -i '/CONFIG_LTO_CLANG_FULL/d' "$CONFIG_FILE"
            echo "CONFIG_LTO_CLANG=y" >> "$CONFIG_FILE"
@@ -296,47 +302,23 @@ jobs:
            echo "# CONFIG_LTO_CLANG_THIN is not set" >> "$CONFIG_FILE"
            echo "# CONFIG_THINLTO is not set" >> "$CONFIG_FILE"
          fi
-         echo "CONFIG_KALLSYMS=y" >> "$CONFIG_FILE"
-         echo "CONFIG_OVERLAY_FS=y" >> "$CONFIG_FILE"
 
-         # DroidSpaces / Container Support
-         DROIDSPACES_CONFIGS=(
-           CONFIG_SYSVIPC
-           CONFIG_POSIX_MQUEUE
-           CONFIG_IPC_NS
-           CONFIG_PID_NS
-           CONFIG_DEVTMPFS
-           CONFIG_NETFILTER_XT_MATCH_ADDRTYPE
-           CONFIG_USER_NS
-           CONFIG_NETFILTER_XT_TARGET_REJECT
-           CONFIG_NETFILTER_XT_TARGET_LOG
-           CONFIG_NETFILTER_XT_MATCH_RECENT
-           CONFIG_IP_SET
-           CONFIG_IP_SET_HASH_IP
-           CONFIG_IP_SET_HASH_NET
-           CONFIG_NETFILTER_XT_SET
-           CONFIG_TMPFS_POSIX_ACL
-           CONFIG_TMPFS_XATTR
-         )
-         echo "🔍 Injecting DroidSpaces configs per kABI rules..."
-         for conf in "${DROIDSPACES_CONFIGS[@]}"; do
-           if grep -q "^${conf}=y" "$CONFIG_FILE"; then
-             echo "✔ ${conf} is already set."
-           elif grep -q "^# ${conf} is not set" "$CONFIG_FILE"; then
-             sed -i "s/^# ${conf} is not set/${conf}=y/" "$CONFIG_FILE"
-             echo "✔ Replaced disabled ${conf} with =y"
-           else
-             echo "${conf}=y" >> "$CONFIG_FILE"
-             echo "✔ Appended ${conf}=y"
-           fi
-         done
+         # Full Metamodule Support
+         echo "CONFIG_KALLSYMS=y" >> "$CONFIG_FILE"
+         echo "CONFIG_TMPFS_XATTR=y" >> "$CONFIG_FILE"
+         echo "CONFIG_TMPFS_POSIX_ACL=y" >> "$CONFIG_FILE"
+         echo "CONFIG_OVERLAY_FS=y" >> "$CONFIG_FILE"
           
+         # Remove existing optimization configs
          sed -i '/CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE/d' "$CONFIG_FILE"
          sed -i '/CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE_O3/d' "$CONFIG_FILE"
          sed -i '/CONFIG_CC_OPTIMIZE_FOR_SIZE/d' "$CONFIG_FILE"
           
+          # Apply selected optimization level
           case "${{ github.event.inputs.optimizationLevel }}" in
-            default) ;;
+            default)
+              # nothing to add here (keep it default)
+              ;;
             O2)
               echo "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y" >> "$CONFIG_FILE"
               echo "# CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE_O3 is not set" >> "$CONFIG_FILE"
@@ -354,91 +336,206 @@ jobs:
               ;;
           esac
                    
+          # Apply selected tick rate
           case "${{ github.event.inputs.tickRate }}" in
-            default) ;;
-            100Hz|250Hz|300Hz|1000Hz)
-              HZ_VAL=$(echo "${{ github.event.inputs.tickRate }}" | sed 's/Hz//')
-              sed -i '/^CONFIG_HZ_100=/d; /^CONFIG_HZ_250=/d; /^CONFIG_HZ_300=/d; /^CONFIG_HZ_1000=/d' "$CONFIG_FILE"
+            default)
+              # nothing to add here (keep it default)
+              ;;
+            100Hz)
+              sed -i '/^CONFIG_HZ_100=/d' "$CONFIG_FILE"
+              sed -i '/^CONFIG_HZ_250=/d' "$CONFIG_FILE"
+              sed -i '/^CONFIG_HZ_300=/d' "$CONFIG_FILE"
+              sed -i '/^CONFIG_HZ_1000=/d' "$CONFIG_FILE"
               echo "CONFIG_NO_HZ_IDLE=y" >> "$CONFIG_FILE"
-              echo "CONFIG_HZ=${HZ_VAL}" >> "$CONFIG_FILE"
-              echo "CONFIG_HZ_${HZ_VAL}=y" >> "$CONFIG_FILE"
+              echo "CONFIG_HZ=100" >> "$CONFIG_FILE"
+              echo "CONFIG_HZ_100=y" >> "$CONFIG_FILE"
+              ;;
+            250Hz)
+              sed -i '/^CONFIG_HZ_100=/d' "$CONFIG_FILE"
+              sed -i '/^CONFIG_HZ_250=/d' "$CONFIG_FILE"
+              sed -i '/^CONFIG_HZ_300=/d' "$CONFIG_FILE"
+              sed -i '/^CONFIG_HZ_1000=/d' "$CONFIG_FILE"
+              echo "CONFIG_NO_HZ_IDLE=y" >> "$CONFIG_FILE"
+              echo "CONFIG_HZ=250" >> "$CONFIG_FILE"
+              echo "CONFIG_HZ_250=y" >> "$CONFIG_FILE"
+              ;;
+            300Hz)
+              sed -i '/^CONFIG_HZ_100=/d' "$CONFIG_FILE"
+              sed -i '/^CONFIG_HZ_250=/d' "$CONFIG_FILE"
+              sed -i '/^CONFIG_HZ_300=/d' "$CONFIG_FILE"
+              sed -i '/^CONFIG_HZ_1000=/d' "$CONFIG_FILE"
+              echo "CONFIG_NO_HZ_IDLE=y" >> "$CONFIG_FILE"
+              echo "CONFIG_HZ=300" >> "$CONFIG_FILE"
+              echo "CONFIG_HZ_300=y" >> "$CONFIG_FILE"
+              ;;
+            1000Hz)
+              sed -i '/^CONFIG_HZ_100=/d' "$CONFIG_FILE"
+              sed -i '/^CONFIG_HZ_250=/d' "$CONFIG_FILE"
+              sed -i '/^CONFIG_HZ_300=/d' "$CONFIG_FILE"
+              sed -i '/^CONFIG_HZ_1000=/d' "$CONFIG_FILE"
+              echo "CONFIG_NO_HZ_IDLE=y" >> "$CONFIG_FILE"
+              echo "CONFIG_HZ=1000" >> "$CONFIG_FILE"
+              echo "CONFIG_HZ_1000=y" >> "$CONFIG_FILE"
               ;;
           esac
 
+          # Sign Builds
           curl -L -o sign.patch "https://raw.githubusercontent.com/topnotchfreaks/kernel_patches/main/0001-scripts-sign-builds.patch" 
           patch -p1 < sign.patch || echo "Warning: Strings patch failed"
 
-      - name: "🔧 Add BBG Support (rooted variants only)"
+          # localversion
+          # curl -L -o localversion.patch "https://raw.githubusercontent.com/topnotchfreaks/kernel_patches/main/0001-scripts-do-not-ship-full-auto_localversion.patch" 
+          # patch -p1 < localversion.patch || echo "Warning: Strings patch failed"
+
+      - name: "🔧 Add BBG Support (KSU variant only)"
         working-directory: ./${{ env.kernelDir }}/${{ env.kernelName }}
-        if: matrix.variant != 'noksu'
         run: |
           echo "Adding BBG...";
           wget -O- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash
           echo "CONFIG_BBG=y" >> arch/arm64/configs/${{ env.DEFCONFIG_NAME }}
           sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
           
-      - name: "📦 Apply SUSFS kernel-side patches"
-        if: matrix.variant != 'noksu'
+      - name: "🔧 Setup Wild KSU with SUSFS"
+        if: matrix.variant == 'ksu' && github.event.inputs.ksuFlavor == 'wildksu'
         working-directory: ./${{ env.kernelDir }}/${{ env.kernelName }}
         run: |
-          set -euo pipefail
-          echo "📦 Cloning susfs4ksu (${{ env.SUSFS_BRANCH }})..."
-          git clone --depth=1 "${{ env.SUSFS_REPO }}" -b "${{ env.SUSFS_BRANCH }}" susfs4ksu
-          echo "SUSFS commit: $(git -C susfs4ksu rev-parse --short=12 HEAD)"
+          rm -rf ./KernelSU ./drivers/kernelsu
+          
+          echo "📦 Installing Wild KSU..."
 
-          # SUSFS kernel patches must go in BEFORE KernelSU is installed
+          # Install WildKSU with SUSFS
+          curl -LSs "https://raw.githubusercontent.com/WildKernels/Wild_KSU/wild/kernel/setup.sh" | bash -s canary
+      
+          echo "✔ Wild KSU installed successfully"
+          
+          # Clone SUSFS4KSU for kernel patches only (not KSU integration)
+          echo "📦 Cloning SUSFS4KSU for kernel patches..."
+          git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android13-5.15
+          
+          SUSFS_KERNEL_PATCH="susfs4ksu/kernel_patches/50_add_susfs_in_gki-android13-5.15.patch"
+          
           echo "🔧 Applying SUSFS kernel patch..."
-          patch -p1 --no-backup-if-mismatch < susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch || echo "⚠️ Warning: SUSFS kernel patch had conflicts"
-          if find . -name '*.rej' | grep -q .; then
-            echo "::warning::SUSFS kernel patch left rejected hunks:"
-            find . -name '*.rej'
+          if patch -p1 < "$SUSFS_KERNEL_PATCH"; then
+            echo "✅ SUSFS patch successfully applied"
+          else
+            echo "⚠️ SUSFS patch failed — copying files manually"
           fi
 
-          echo "📄 Injecting SUSFS source files..."
-          mkdir -p fs include/linux
+          echo "🔧 Applying SUSFS -> KernelSU patch..."
+          KSU_PATCH="susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
+          
+          echo "📄 Forcing SUSFS source injection..."
+          
+          # Always replace fs/susfs.c
+          mkdir -p fs
           cp -f susfs4ksu/kernel_patches/fs/susfs.c fs/susfs.c
+          echo "✔ Copied fs/susfs.c"
+          
+          # Always replace include/linux/susfs.h
+          mkdir -p include/linux
           cp -f susfs4ksu/kernel_patches/include/linux/susfs.h include/linux/susfs.h
+          echo "✔ Copied include/linux/susfs.h"
+          
+          # Also install missing susfs_def.h
           if [ -f susfs4ksu/kernel_patches/include/linux/susfs_def.h ]; then
             cp -f susfs4ksu/kernel_patches/include/linux/susfs_def.h include/linux/susfs_def.h
-          fi
-          grep -E '^#define SUSFS_VERSION' include/linux/susfs.h || true
-
-      - name: "🔧 Setup Wild KSU"
-        if: matrix.variant == 'wildksu'
-        working-directory: ./${{ env.kernelDir }}/${{ env.kernelName }}
-        run: |
-          set -euo pipefail
-          rm -rf ./KernelSU ./drivers/kernelsu
-
-          echo "📦 Installing Wild KSU (${{ github.event.inputs.wildKsuRef }})..."
-          curl -LSs "https://raw.githubusercontent.com/WildKernels/Wild_KSU/wild/kernel/setup.sh" | bash -s ${{ github.event.inputs.wildKsuRef }}
-
-          # Wild KSU carries SUSFS in its own tree: only patch it when it really doesn't
-          if grep -qr "config KSU_SUSFS" KernelSU/kernel/Kconfig; then
-            echo "✅ Wild KSU already ships SUSFS support, skipping 10_enable_susfs_for_ksu.patch"
+            echo "✔ Copied include/linux/susfs_def.h"
           else
-            echo "🔧 Applying SUSFS -> KernelSU patch..."
-            cd KernelSU
-            patch -p1 --no-backup-if-mismatch < ../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch || echo "⚠️ Warning: KSU patch had conflicts"
-            cd ..
+            echo "⚠️ susfs_def.h not found in repo"
           fi
-
+          
+          echo "🔍 Verifying SUSFS files..."
+          for f in fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h; do
+            if [ -f "$f" ]; then echo "✔ Found: $f"; else echo "❌ Missing: $f"; fi
+          done
+          
+          # Clean up SUSFS repo (we only needed kernel patches, not KSU integration)
           rm -rf susfs4ksu
-          echo "🎉 Wild KSU with SUSFS integrated!"
+          
+          # Create symbolic link for drivers/kernelsu (if needed by build system)
+          if [ ! -L "drivers/kernelsu" ]; then
+            ln -sf ../KernelSU drivers/kernelsu
+            echo "✔ Created drivers/kernelsu symlink"
+          fi
+          
+          # Add Wild KSU configs with SUSFS
+          CONFIG_FILE="arch/arm64/configs/${{ env.DEFCONFIG_NAME }}"
+          cat >> "$CONFIG_FILE" << 'EOF'
+          CONFIG_KSU=y
+          CONFIG_KPROBES=y
+          CONFIG_HAVE_KPROBES=y
+          CONFIG_KPROBE_EVENTS=y
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_SUS_SU=y
+          EOF
+
+          # hooks patch
+          # curl -L -o hooks.patch "https://raw.githubusercontent.com/topnotchfreaks/kernel_patches/main/0001-69-pure-manual-hooks-only.patch" 
+          # patch -p1 < hooks.patch || echo "Warning: Strings patch failed"
+          
+          echo "🎉 Wild KSU with SUSFS kernel patches fully integrated!"
 
       - name: "🔧 Setup ApkeSU with SUSFS"
-        if: matrix.variant == 'apkesu'
+        if: matrix.variant == 'ksu' && github.event.inputs.ksuFlavor == 'apkesu'
         working-directory: ./${{ env.kernelDir }}/${{ env.kernelName }}
         run: |
           set -euo pipefail
           rm -rf ./KernelSU ./drivers/kernelsu
 
           echo "📦 Installing ApkeSU (${{ github.event.inputs.apkeSuRef }})..."
+          # setup.sh clones ApkeSU into ./KernelSU and symlinks drivers/kernelsu -> KernelSU/kernel
           curl -LSs "https://raw.githubusercontent.com/fixz232/ApkeSU/ApkeSU/kernel/setup.sh" | bash -s ${{ github.event.inputs.apkeSuRef }}
+          echo "✔ ApkeSU installed successfully"
 
-          # ApkeSU is kprobe-based and its tree does NOT accept susfs4ksu's
-          # 10_enable_susfs_for_ksu.patch (that patch would strip ApkeSU's own hook
-          # layer). We ship a dedicated integration patch instead.
+          echo "📦 Cloning SUSFS4KSU for kernel patches..."
+          git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android13-5.15
+          echo "✔ susfs4ksu at $(git -C susfs4ksu rev-parse --short=12 HEAD)"
+
+          SUSFS_KERNEL_PATCH="susfs4ksu/kernel_patches/50_add_susfs_in_gki-android13-5.15.patch"
+
+          echo "🔧 Applying SUSFS kernel patch..."
+          if patch -p1 < "$SUSFS_KERNEL_PATCH"; then
+            echo "✅ SUSFS patch successfully applied"
+          else
+            echo "⚠️ SUSFS patch failed — copying files manually"
+          fi
+
+          echo "📄 Forcing SUSFS source injection..."
+          mkdir -p fs
+          cp -f susfs4ksu/kernel_patches/fs/susfs.c fs/susfs.c
+          echo "✔ Copied fs/susfs.c"
+
+          mkdir -p include/linux
+          cp -f susfs4ksu/kernel_patches/include/linux/susfs.h include/linux/susfs.h
+          echo "✔ Copied include/linux/susfs.h"
+
+          if [ -f susfs4ksu/kernel_patches/include/linux/susfs_def.h ]; then
+            cp -f susfs4ksu/kernel_patches/include/linux/susfs_def.h include/linux/susfs_def.h
+            echo "✔ Copied include/linux/susfs_def.h"
+          else
+            echo "⚠️ susfs_def.h not found in repo"
+          fi
+
+          echo "🔍 Verifying SUSFS files..."
+          for f in fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h; do
+            if [ -f "$f" ]; then echo "✔ Found: $f"; else echo "❌ Missing: $f"; fi
+          done
+
+          # ApkeSU is kprobe-based: susfs4ksu's own 10_enable_susfs_for_ksu.patch does NOT
+          # apply to it (it would strip ApkeSU's hook layer), so we ship our own patch.
           echo "🔧 Applying ApkeSU <-> SUSFS integration patch..."
           cd KernelSU
           patch -p1 --no-backup-if-mismatch < "${{ env.WORK_DIR }}/builder/patches/susfs-apkesu.patch"
@@ -450,17 +547,10 @@ jobs:
           cd ..
 
           rm -rf susfs4ksu
-          echo "🎉 ApkeSU with SUSFS integrated!"
 
-      - name: "⚙️ Configure root + SUSFS defconfig"
-        if: matrix.variant != 'noksu'
-        working-directory: ./${{ env.kernelDir }}/${{ env.kernelName }}
-        run: |
-          set -euo pipefail
+          # CONFIG_KSU must be =y: the SUSFS kernel patch references KernelSU symbols from
+          # built-in kernel code, LKM mode would not link.
           CONFIG_FILE="arch/arm64/configs/${{ env.DEFCONFIG_NAME }}"
-
-          # CONFIG_KSU must stay built-in (=y): the SUSFS kernel patch references
-          # KernelSU symbols from built-in kernel code, LKM mode would not link.
           cat >> "$CONFIG_FILE" << 'EOF'
           CONFIG_KSU=y
           CONFIG_KPROBES=y
@@ -479,21 +569,9 @@ jobs:
           CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
           EOF
 
-          # Legacy SUSFS switches: still defined by Wild KSU's own Kconfig, but no
-          # longer defined by current susfs4ksu (and therefore not by ApkeSU).
-          if [ "${{ matrix.variant }}" = "wildksu" ]; then
-          cat >> "$CONFIG_FILE" << 'EOF'
-          CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
-          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
-          CONFIG_KSU_SUSFS_SUS_SU=y
-          EOF
-          fi
-
-          echo "--- root/SUSFS configs in defconfig ---"
+          echo "--- KSU configs in defconfig ---"
           grep -E '^CONFIG_KSU' "$CONFIG_FILE"
+          echo "🎉 ApkeSU with SUSFS fully integrated!"
 
       - name: "🔨 Build kernel"
         if: github.event.inputs.buildToolchains == 'android-tools'
@@ -532,11 +610,13 @@ jobs:
         working-directory: ${{ env.WORK_DIR }}
         run: |
          mkdir -p out/dist
+
          if [ "${{ github.event.inputs.buildToolchains }}" = "android-tools" ]; then
           src="out/dist/Image"
          else
           src="${{ env.kernelDir }}/${{ env.kernelName }}/out/arch/arm64/boot/Image"
          fi
+
          cp "${src}" "out/dist/Image.${{ matrix.variant }}"
     
       - name: "📤 Upload kernel"
@@ -556,42 +636,41 @@ jobs:
         with:
           path: ./kernels/
 
-      - name: "📦 Create flashable ZIPs"
+      - name: "📦 Create flashable ZIP"
         run: |
           BUILD_TIME=$(date +'%Y-%m-%d')
+          git clone --depth=1 https://github.com/topnotchfreaks/AnyKernel3 -b master AnyKernel3
           
-          for folder in kernels/*; do
-            if [ -d "$folder" ]; then
-              VARIANT=$(basename "$folder" | sed 's/kernel-//')
-              IMAGE_FILE="$folder/Image.$VARIANT"
-              
-              if [ -f "$IMAGE_FILE" ]; then
-                echo "Packaging variant: $VARIANT"
-                git clone --depth=1 https://github.com/topnotchfreaks/AnyKernel3 -b master "AnyKernel3_$VARIANT"
-                
-                # Копируем и переименовываем в стандартный Image для TWRP
-                cp "$IMAGE_FILE" "AnyKernel3_$VARIANT/Image"
-                
-                ZIP_NAME="Anykernel3_${{ github.event.inputs.kernelBranch }}_${VARIANT}_${BUILD_TIME}.zip"
-                cd "AnyKernel3_$VARIANT"
-                zip -r9 "../$ZIP_NAME" * -x .git/*
-                cd ..
-              fi
-            fi
-          done
+          # Copy kernels
+          find kernels -name "Image.*" -exec cp {} AnyKernel3/ \;
+          
+          # Create ZIP
+          ZIP_NAME="Anykernel3_${{ github.event.inputs.kernelBranch }}_${BUILD_TIME}.zip"
+          cd AnyKernel3
+          zip -r9 "../$ZIP_NAME" * -x .git/*
+          cd ..
+          echo "ZIP_PATH=$(pwd)/$ZIP_NAME" >> $GITHUB_ENV
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
 
-      - name: "📤 Upload final packages"
+      - name: "📤 Upload final package"
         uses: actions/upload-artifact@v4
         with:
-          name: AnyKernel3-Releases
-          path: "*.zip"
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_PATH }}
           retention-days: 1
 
       - name: "📱 Send to Telegram"
         if: always()
         run: |
-         if ls *.zip 1> /dev/null 2>&1; then
-           CAPTION="✅ *Kernel Build Successful*
+         if [[ -f "${{ env.ZIP_PATH }}" ]]; then
+          KSU_TEXT=""
+         if [ "${{ github.event.inputs.buildKSU }}" != "noksu" ]; then
+          KSU_TEXT="
+          
+         🔐 *KSU Variant:* \`${{ github.event.inputs.ksuFlavor }}\`"
+         fi
+      
+         CAPTION="✅ *Kernel Build Successful*
       
          📦 *Build Information:*
          • Kernel: \`Linux ${{ env.KERNEL_VERSION }}\`
@@ -603,44 +682,46 @@ jobs:
          • LTO: \`${{ github.event.inputs.LtoOptimizations }}\`
          • Optimization: \`-${{ github.event.inputs.optimizationLevel }}\`
          • Tick Rate: \`${{ github.event.inputs.tickRate }}\`
-         • Variants: \`${{ github.event.inputs.buildKSU }}\`
-         • Root: \`Wild KSU (${{ github.event.inputs.wildKsuRef }}) / ApkeSU (${{ github.event.inputs.apkeSuRef }})\`
-         • SUSFS: \`Enabled for rooted variants (GKI A13-5.15)\`
+         • Build Type: \`${{ github.event.inputs.buildKSU }}\`${KSU_TEXT}
+         • SUSFS: \`Enabled (GKI A13-5.15)\`
          • Local Version: \`${{ github.event.inputs.localVersion }}\`
          • Build Tools: \`${{ github.event.inputs.buildToolchains }}\`
+         • Manager: \`KSU,Wild-KSU,KSUN,rKSU and KowSU\`
     
-         🕐 *Build Date:* $(date '+%Y-%m-%d %H:%M:%S UTC')"
+         🕐 *Build Date:* $(date '+%Y-%m-%d %H:%M:%S UTC')
+         📦 *Package:* \`${{ env.ZIP_NAME }}\`"
       
-           for zip in *.zip; do
-             curl -s -F document=@"$zip" \
-               -F caption="$CAPTION" \
-               -F parse_mode="Markdown" \
-               -F chat_id=${{ secrets.TELEGRAM_USER_ID }} \
-               "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendDocument"
-           done
+         curl -s -F document=@"${{ env.ZIP_PATH }}" \
+           -F caption="$CAPTION" \
+           -F parse_mode="Markdown" \
+           -F chat_id=${{ secrets.TELEGRAM_USER_ID }} \
+           "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendDocument"
          else
-           FAILURE_MSG="❌ *Kernel Build Failed*
+         FAILURE_MSG="❌ *Kernel Build Failed*
       
          📦 *Build Information:*
          • Kernel: \`Linux ${{ env.KERNEL_VERSION }}\`
          • Android: \`13-16\`
          • Branch: \`${{ github.event.inputs.kernelBranch }}\`
-         • Device: \`${{ github.event.inputs.kernelDevice }}\`
+         • Device: \`Redmi Note 12/13 4G. Pad SE\`
     
          ⚙️ *Configuration:*
          • LTO: \`${{ github.event.inputs.LtoOptimizations }}\`
          • Optimization: \`-${{ github.event.inputs.optimizationLevel }}\`
          • Tick Rate: \`${{ github.event.inputs.tickRate }}\`
-         • Variants: \`${{ github.event.inputs.buildKSU }}\`
+         • Build Type: \`${{ github.event.inputs.buildKSU }}\`${KSU_TEXT}
+         • SUSFS: \`Enabled (GKI A13-5.15)\`
          • Local Version: \`${{ github.event.inputs.localVersion }}\`
+         • Build Tools: \`${{ github.event.inputs.buildToolchains }}\`
+         • Manager: \`KSU,Wild-KSU,KSUN,rKSU and KowSU\`
       
          🕐 *Failed at:* $(date '+%Y-%m-%d %H:%M:%S UTC')
     
          🔍 Check the [workflow logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details."
       
-           curl -s -X POST \
-             -d chat_id=${{ secrets.TELEGRAM_USER_ID }} \
-             -d text="$FAILURE_MSG" \
-             -d parse_mode="Markdown" \
-             "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage"
+         curl -s -X POST \
+           -d chat_id=${{ secrets.TELEGRAM_USER_ID }} \
+           -d text="$FAILURE_MSG" \
+           -d parse_mode="Markdown" \
+           "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage"
          fi
