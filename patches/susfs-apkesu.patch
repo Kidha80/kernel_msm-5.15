@@ -1,4 +1,4 @@
-Integrate susfs4ksu into ApkeSU (kprobe-based tree) + fix in-tree include paths
+Integrate susfs4ksu into ApkeSU (kprobe-based tree) + build/runtime fixes
 
 Generated against:
   ApkeSU     : https://github.com/fixz232/ApkeSU @ f2d024608d99 (branch ApkeSU)
@@ -6,31 +6,26 @@ Generated against:
 
 Part 1 - SUSFS integration
 --------------------------
-susfs4ksu ships two patches: a kernel-side one (50_add_susfs_in_gki-*.patch, applied
-to the kernel tree) and a KernelSU-side one (KernelSU/10_enable_susfs_for_ksu.patch).
-The latter does NOT apply to ApkeSU: it targets a KernelSU revision that uses manual
-kernel hooks, and it would strip ApkeSU's own hook layer (hook/lsm_hook.o,
-hook/syscall_hook_manager.o, infra/symbol_resolver.o, arm64 syscall hooks), rewrite
-sucompat/setuid_hook to different signatures and delete ApkeSU's
-KSU_X86_PATCH_SYSCALL_DISPATCHER option.
-
-This patch replaces 10_enable_susfs_for_ksu.patch for ApkeSU. It only adds susfs
-support and keeps every ApkeSU feature intact:
+susfs4ksu's KernelSU-side patch (KernelSU/10_enable_susfs_for_ksu.patch) does NOT apply
+to ApkeSU: it targets a manual-hook KernelSU revision and would strip ApkeSU's own hook
+layer (hook/lsm_hook.o, hook/syscall_hook_manager.o, infra/symbol_resolver.o, arm64
+syscall hooks), rewrite sucompat/setuid_hook to different signatures and delete ApkeSU's
+KSU_X86_PATCH_SYSCALL_DISPATCHER option. This patch replaces it for ApkeSU, adding susfs
+support only and keeping every ApkeSU feature intact:
 
   * kernel/Kconfig       - susfs options (CONFIG_KSU_SUSFS*, default n = opt-in)
   * kernel/Makefile      - susfs version banner
   * kernel/core/init.c   - susfs_init()
   * kernel/selinux/*     - sid helpers susfs needs + susfs_set_batch_sid()
-  * kernel/supercall/*   - ksu_handle_sys_reboot(): the susfs command entry that susfs'
-                           kernel-side patch calls from SYSCALL_DEFINE4(reboot)
+  * kernel/supercall/*   - ksu_handle_sys_reboot(): susfs command entry called from
+                           SYSCALL_DEFINE4(reboot) by susfs' kernel-side patch
   * kernel/feature/kernel_umount.c
-                         - mark the process as umounted for susfs and kick susfs'
-                           deferred work after umounting
+                         - mark process umounted for susfs + kick susfs deferred work
   * kernel/feature/susfs_compat.c (new)
                          - gate keys + inert stubs for susfs' *manual* hooks (su compat,
-                           safe-mode input, init.rc). ApkeSU wires all of those through
-                           its own kprobe/syscall hooks, so the manual hooks stay
-                           disabled to avoid double handling.
+                           safe-mode input, init.rc). ApkeSU wires those through its own
+                           kprobe/syscall hooks; keeping the manual hooks off avoids
+                           double handling.
   * de-static selinux_hide internals referenced by the kernel-side patch
   * renames to free names the kernel-side patch owns:
       bool  ksu_su_compat_enabled  -> ksu_su_compat_toggle
@@ -38,16 +33,25 @@ support and keeps every ApkeSU feature intact:
 
 Part 2 - in-tree (built-in) build fix
 -------------------------------------
-kernel/Kbuild derives the repo root with $(abspath $(KSU_KERNEL_DIR)/..). For a built-in
-build the driver is reached through the drivers/kernelsu symlink created by setup.sh,
-and $(abspath) collapses ".." lexically without following symlinks, so the root resolves
-to <srctree>/drivers. The result is:
+kernel/Kbuild derived the repo root with $(abspath $(KSU_KERNEL_DIR)/..). For a built-in
+build the driver is reached through the drivers/kernelsu symlink created by setup.sh, and
+$(abspath) collapses ".." lexically without following symlinks, so the root resolved to
+<srctree>/drivers -> "fatal error: 'uapi/app_profile.h' file not found" (and
+version.properties / dist/manager_identity.mk silently missed). Resolve the symlink
+physically ("cd -P") and prefer that result. Out-of-tree LKM builds pass an absolute real
+path, where this is a no-op.
 
-  fatal error: 'uapi/app_profile.h' file not found
-
-and version.properties / dist/manager_identity.mk are silently missed as well. The patch
-resolves the symlink physically ("cd -P") and prefers that result when available.
-Out-of-tree LKM builds pass an absolute real path, where this is a no-op.
+Part 3 - selinux_hide: best-effort setprocattr hook
+---------------------------------------------------
+On this CodeLinaro / QGKI 5.15 kernel selinux_setprocattr is inlined and has no kallsyms
+symbol (only the generic security_setprocattr dispatcher exists), so ApkeSU's LSM-slot
+hook cannot resolve its target and ksu_lsm_hook() returns -ENOENT. ApkeSU treated that as
+fatal (goto unhook -> the whole "Hide SELinux modification" feature failed with -38/-ENOSYS),
+even though the primary SELinux hiding - fake enforce status and write_op context/access
+spoofing - had already been installed successfully. Make the setprocattr hook best-effort:
+on resolve failure, warn and keep the rest of selinux_hide active instead of tearing it all
+down. The setprocattr hook only spoofs writes to /proc/self/attr/current; losing it leaves
+a narrow vector while the main root-revealing vector (enforce status leak) stays hidden.
 
 Requires CONFIG_KSU=y (built-in): the kernel-side patch references KSU symbols from
 built-in kernel code, so LKM mode will not link.
@@ -288,7 +292,7 @@ index f914ff8..5cb984c 100644
  }
  
 diff --git a/kernel/feature/selinux_hide.c b/kernel/feature/selinux_hide.c
-index 843a301..9cd143d 100644
+index 843a301..906a28f 100644
 --- a/kernel/feature/selinux_hide.c
 +++ b/kernel/feature/selinux_hide.c
 @@ -30,8 +30,8 @@
@@ -325,6 +329,23 @@ index 843a301..9cd143d 100644
  {
      mutex_lock(&selinux_state.status_lock);
      if (fake_status)
+@@ -360,8 +360,14 @@ static int ksu_selinux_hide_enable()
+ 
+     ret = ksu_lsm_hook(&selinux_setprocattr_hook);
+     if (ret) {
+-        pr_err("selinux_hide: init: selinux_setprocattr_hook err: %d\n", ret);
+-        goto unhook;
++        // On some kernels (e.g. CodeLinaro / QGKI 5.15) selinux_setprocattr is
++        // inlined and has no kallsyms symbol, so the LSM slot target cannot be
++        // resolved (-ENOENT / -2). This hook only spoofs writes to
++        // /proc/self/attr/current; the primary SELinux status and policy hiding
++        // (enforce status + write_op context/access, installed above) does not
++        // depend on it. Treat it as best-effort so the whole feature is not torn
++        // down over this single missing symbol.
++        pr_warn("selinux_hide: setprocattr hook unavailable (%d), continuing without it\n", ret);
+     }
+ 
+     return 0;
 diff --git a/kernel/feature/sucompat.c b/kernel/feature/sucompat.c
 index 33df9d1..412b506 100644
 --- a/kernel/feature/sucompat.c
