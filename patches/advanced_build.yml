@@ -50,6 +50,14 @@ on:
         required: false
         type: string
         default: "ApkeSU"
+      silentLog:
+        description: "Silent kernel log (compile out all KSU/SUSFS printk; apkesu only)"
+        required: false
+        type: choice
+        default: "no"
+        options:
+          - "no"
+          - "yes"
 
       tickRate:
         description: "Kernel tick rate (Hz)"
@@ -123,6 +131,29 @@ jobs:
         run: |
           git clone --recursive --branch ${{ github.event.inputs.kernelBranch }} \
             ${{ github.event.inputs.kernelSourceURL }} ${{ env.kernelName }} --depth=1
+
+      - name: "🩹 Fix broken FUSE in kernel source"
+        working-directory: ./${{ env.kernelDir }}/${{ env.kernelName }}
+        run: |
+          set -euo pipefail
+          # The CodeLinaro source carries a partial FUSE backport: fs/fuse/dev.c uses
+          # FR_INTR_QUEUED and dprintk(), neither of which exists in this tree.
+          # Unrelated to KSU/SUSFS - it breaks plain noksu builds too.
+          if grep -q "FR_INTR_QUEUED" fs/fuse/dev.c && ! grep -q "FR_INTR_QUEUED" fs/fuse/fuse_i.h; then
+            echo "🔧 Adding missing FR_INTR_QUEUED to enum fuse_req_flag..."
+            sed -i '/^enum fuse_req_flag {/,/^};/ s/^\tFR_PENDING,$/\tFR_PENDING,\n\tFR_INTR_QUEUED,/' fs/fuse/fuse_i.h
+            grep -q "FR_INTR_QUEUED" fs/fuse/fuse_i.h || { echo "::error::failed to add FR_INTR_QUEUED"; exit 1; }
+            sed -n '/^enum fuse_req_flag {/,/^};/p' fs/fuse/fuse_i.h
+          else
+            echo "✔ FUSE enum looks fine, nothing to do"
+          fi
+
+          if grep -q "dprintk(" fs/fuse/*.c && ! grep -rq "define dprintk" fs/fuse/; then
+            echo "🔧 Replacing undefined dprintk() with pr_debug() in FUSE..."
+            sed -i 's/\bdprintk(/pr_debug(/g' fs/fuse/*.c
+          else
+            echo "✔ No stray dprintk() in FUSE"
+          fi
 
       - name: "📥 Initialize repo"
         if: github.event.inputs.buildToolchains == 'android-tools'
@@ -537,8 +568,15 @@ jobs:
           # ApkeSU is kprobe-based: susfs4ksu's own 10_enable_susfs_for_ksu.patch does NOT
           # apply to it (it would strip ApkeSU's hook layer), so we ship our own patch.
           echo "🔧 Applying ApkeSU <-> SUSFS integration patch..."
+          PATCH_FILE="${{ env.WORK_DIR }}/builder/patches/susfs-apkesu.patch"
+          # Copy-pasting the patch through a web editor can strip its trailing newline,
+          # which makes GNU patch abort with "unexpectedly ends in middle of line".
+          if [ -n "$(tail -c 1 "$PATCH_FILE")" ]; then
+            echo "⚠️ patch file has no trailing newline, adding one"
+            printf '\n' >> "$PATCH_FILE"
+          fi
           cd KernelSU
-          patch -p1 --no-backup-if-mismatch < "${{ env.WORK_DIR }}/builder/patches/susfs-apkesu.patch"
+          patch -p1 --no-backup-if-mismatch < "$PATCH_FILE"
           if find . -name '*.rej' | grep -q .; then
             echo "::error::ApkeSU SUSFS patch left rejected hunks - ApkeSU upstream moved, patch needs a refresh:"
             find . -name '*.rej' -exec cat {} +
@@ -565,9 +603,16 @@ jobs:
           CONFIG_KSU_SUSFS_SPOOF_UNAME=y
           CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
           CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
-          CONFIG_KSU_SUSFS_ENABLE_LOG=y
           CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
           EOF
+
+          if [ "${{ github.event.inputs.silentLog }}" = "yes" ]; then
+            echo "🔇 Silent build: compiling out all KSU/SUSFS kernel log output"
+            echo "CONFIG_KSU_SILENT_LOG=y" >> "$CONFIG_FILE"
+            echo "# CONFIG_KSU_SUSFS_ENABLE_LOG is not set" >> "$CONFIG_FILE"
+          else
+            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "$CONFIG_FILE"
+          fi
 
           echo "--- KSU configs in defconfig ---"
           grep -E '^CONFIG_KSU' "$CONFIG_FILE"
