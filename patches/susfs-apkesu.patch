@@ -7,51 +7,39 @@ Generated against:
 Part 1 - SUSFS integration
 --------------------------
 susfs4ksu's KernelSU-side patch (KernelSU/10_enable_susfs_for_ksu.patch) does NOT apply
-to ApkeSU: it targets a manual-hook KernelSU revision and would strip ApkeSU's own hook
-layer (hook/lsm_hook.o, hook/syscall_hook_manager.o, infra/symbol_resolver.o, arm64
-syscall hooks), rewrite sucompat/setuid_hook to different signatures and delete ApkeSU's
-KSU_X86_PATCH_SYSCALL_DISPATCHER option. This patch replaces it for ApkeSU, adding susfs
-support only and keeping every ApkeSU feature intact:
-
-  * kernel/Kconfig       - susfs options (CONFIG_KSU_SUSFS*, default n = opt-in)
-  * kernel/Makefile      - susfs version banner
-  * kernel/core/init.c   - susfs_init()
-  * kernel/selinux/*     - sid helpers susfs needs + susfs_set_batch_sid()
-  * kernel/supercall/*   - ksu_handle_sys_reboot(): susfs command entry called from
-                           SYSCALL_DEFINE4(reboot) by susfs' kernel-side patch
-  * kernel/feature/kernel_umount.c
-                         - mark process umounted for susfs + kick susfs deferred work
-  * kernel/feature/susfs_compat.c (new)
-                         - gate keys + inert stubs for susfs' *manual* hooks (su compat,
-                           safe-mode input, init.rc). ApkeSU wires those through its own
-                           kprobe/syscall hooks; keeping the manual hooks off avoids
-                           double handling.
-  * de-static selinux_hide internals referenced by the kernel-side patch
-  * renames to free names the kernel-side patch owns:
-      bool  ksu_su_compat_enabled  -> ksu_su_compat_toggle
-      2-arg ksu_handle_setresuid   -> ksu_handle_setresuid_transition
+to ApkeSU (manual-hook tree; it would strip ApkeSU's own hook layer). This patch replaces
+it for ApkeSU, adding susfs support only and keeping every ApkeSU feature intact:
+Kconfig options, susfs_init(), selinux sid helpers, ksu_handle_sys_reboot() (susfs command
+entry called from SYSCALL_DEFINE4(reboot)), umount->susfs bridge in kernel_umount.c, and a
+new feature/susfs_compat.c holding gate keys + inert stubs for susfs' manual hooks (ApkeSU
+wires those through its own kprobe/syscall hooks). Renames to free names the kernel-side
+patch owns: ksu_su_compat_enabled -> ksu_su_compat_toggle, 2-arg ksu_handle_setresuid ->
+ksu_handle_setresuid_transition.
 
 Part 2 - in-tree (built-in) build fix
 -------------------------------------
-kernel/Kbuild derived the repo root with $(abspath $(KSU_KERNEL_DIR)/..). For a built-in
-build the driver is reached through the drivers/kernelsu symlink created by setup.sh, and
-$(abspath) collapses ".." lexically without following symlinks, so the root resolved to
-<srctree>/drivers -> "fatal error: 'uapi/app_profile.h' file not found" (and
-version.properties / dist/manager_identity.mk silently missed). Resolve the symlink
-physically ("cd -P") and prefer that result. Out-of-tree LKM builds pass an absolute real
-path, where this is a no-op.
+kernel/Kbuild resolved the repo root with $(abspath $(KSU_KERNEL_DIR)/..). Built-in builds
+reach the driver through the drivers/kernelsu symlink from setup.sh, and $(abspath) does not
+follow symlinks, so the root pointed at <srctree>/drivers ("fatal error: 'uapi/app_profile.h'
+file not found"). Resolve the symlink physically ("cd -P"). No-op for out-of-tree LKM builds.
 
 Part 3 - selinux_hide: best-effort setprocattr hook
 ---------------------------------------------------
-On this CodeLinaro / QGKI 5.15 kernel selinux_setprocattr is inlined and has no kallsyms
-symbol (only the generic security_setprocattr dispatcher exists), so ApkeSU's LSM-slot
-hook cannot resolve its target and ksu_lsm_hook() returns -ENOENT. ApkeSU treated that as
-fatal (goto unhook -> the whole "Hide SELinux modification" feature failed with -38/-ENOSYS),
-even though the primary SELinux hiding - fake enforce status and write_op context/access
-spoofing - had already been installed successfully. Make the setprocattr hook best-effort:
-on resolve failure, warn and keep the rest of selinux_hide active instead of tearing it all
-down. The setprocattr hook only spoofs writes to /proc/self/attr/current; losing it leaves
-a narrow vector while the main root-revealing vector (enforce status leak) stays hidden.
+On CodeLinaro / QGKI 5.15, selinux_setprocattr is inlined and has no kallsyms symbol, so
+ApkeSU's LSM-slot hook returned -ENOENT and the whole "Hide SELinux modification" feature
+failed with -38/-ENOSYS even though the primary hiding (fake enforce status + write_op
+context/access) was already installed. Make the setprocattr hook best-effort: on resolve
+failure warn and keep the rest of selinux_hide active.
+
+Part 4 - CONFIG_KSU_SILENT_LOG (opt-in log suppression)
+-------------------------------------------------------
+New Kconfig option. When set, klog.h redefines the driver's pr_* macros to no_printk(), so
+no KernelSU/ApkeSU line ever enters the kernel ring buffer (dmesg / last_kmsg / bugreport).
+symbol_resolver.c now also includes klog.h so its messages are covered. Runtime tricks
+(loglevel, dmesg_restrict) do not help against privileged bugreport/dumpstate, so the
+strings must be kept out of the buffer at compile time. Pair with
+# CONFIG_KSU_SUSFS_ENABLE_LOG is not set to also compile out susfs' own SUSFS_LOGx lines.
+Default n; enable only for hidden builds, disable to get logs back for debugging.
 
 Requires CONFIG_KSU=y (built-in): the kernel-side patch references KSU symbols from
 built-in kernel code, so LKM mode will not link.
@@ -108,13 +96,23 @@ index 8eebadb..f0b6cb8 100644
  include $(KSU_MANAGER_IDENTITY)
  $(info -- KernelSU Manager identity: $(KSU_MANAGER_IDENTITY))
 diff --git a/kernel/Kconfig b/kernel/Kconfig
-index 88e2281..55a635c 100644
+index 88e2281..d5f8cd7 100644
 --- a/kernel/Kconfig
 +++ b/kernel/Kconfig
-@@ -43,4 +43,95 @@ config KSU_X86_PATCH_SYSCALL_DISPATCHER
+@@ -43,4 +43,105 @@ config KSU_X86_PATCH_SYSCALL_DISPATCHER
  	  Dynamically patch x64's hardened syscall dispatcher to support syscall hooks. This is a
  	  replacement for a kernel source code patch, and is useful for x86_64 LKM mode.
  
++config KSU_SILENT_LOG
++	bool "Silence all KernelSU/ApkeSU kernel log output"
++	depends on KSU
++	default n
++	help
++	  Compile out every pr_*/log call inside the KernelSU driver so that no
++	  KernelSU/ApkeSU line ever enters the kernel ring buffer (dmesg,
++	  last_kmsg, bugreport / dumpstate). Intended for root hiding. Turn this
++	  off if you need driver logs for debugging.
++
 +menu "KernelSU - SUSFS"
 +config KSU_SUSFS
 +	bool "KernelSU addon - SUSFS"
@@ -527,6 +525,46 @@ index a961321..4c194b5 100644
 +    ksu_handle_setresuid_transition(old_uid, current_uid().val);
      return ret;
  }
+diff --git a/kernel/include/klog.h b/kernel/include/klog.h
+index a934027..48bea1c 100644
+--- a/kernel/include/klog.h
++++ b/kernel/include/klog.h
+@@ -8,4 +8,23 @@
+ #define pr_fmt(fmt) "KernelSU: " fmt
+ #endif
+ 
++#ifdef CONFIG_KSU_SILENT_LOG
++/*
++ * Silent build: drop every driver log line at compile time so that no
++ * KernelSU/ApkeSU message ever reaches the kernel ring buffer (dmesg,
++ * last_kmsg, bugreport / dumpstate). no_printk() keeps printf-style format
++ * checking but expands to nothing at runtime.
++ */
++#undef pr_info
++#undef pr_err
++#undef pr_warn
++#undef pr_notice
++#undef pr_debug
++#define pr_info(fmt, ...)   no_printk(fmt, ##__VA_ARGS__)
++#define pr_err(fmt, ...)    no_printk(fmt, ##__VA_ARGS__)
++#define pr_warn(fmt, ...)   no_printk(fmt, ##__VA_ARGS__)
++#define pr_notice(fmt, ...) no_printk(fmt, ##__VA_ARGS__)
++#define pr_debug(fmt, ...)  no_printk(fmt, ##__VA_ARGS__)
++#endif // CONFIG_KSU_SILENT_LOG
++
+ #endif
+diff --git a/kernel/infra/symbol_resolver.c b/kernel/infra/symbol_resolver.c
+index f957669..71da0ec 100644
+--- a/kernel/infra/symbol_resolver.c
++++ b/kernel/infra/symbol_resolver.c
+@@ -4,6 +4,7 @@
+ #include <linux/version.h>
+ 
+ #include "infra/symbol_resolver.h"
++#include "klog.h" // IWYU pragma: keep
+ 
+ // https://github.com/torvalds/linux/commit/89245600941e4e0f87d77f60ee269b5e61ef4e49
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
 diff --git a/kernel/selinux/rules.c b/kernel/selinux/rules.c
 index 762a7c5..250676f 100644
 --- a/kernel/selinux/rules.c
