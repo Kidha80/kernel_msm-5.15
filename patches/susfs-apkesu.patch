@@ -4,21 +4,20 @@ Re-synced against:
   ApkeSU     : https://github.com/fixz232/ApkeSU @ 9229e8223a06 (branch ApkeSU)
   susfs4ksu  : https://gitlab.com/simonpunk/susfs4ksu @ 45ca4011fc64 (branch gki-android13-5.15, SUSFS v2.2.0)
 
-Adds susfs support to ApkeSU without disturbing its own hook layer, plus:
-- Kbuild: build feature/susfs_compat.o; resolve the drivers/kernelsu symlink physically
-  (cd -P) so in-tree includes (uapi/, version.properties, dist/manager_identity.mk) resolve.
-- Kconfig: CONFIG_KSU_SUSFS* options + CONFIG_KSU_SILENT_LOG (hidden build).
-- feature/susfs_compat.c: gate keys + inert stubs for susfs' manual hooks (ApkeSU uses its
-  own kprobe/syscall hooks).
-- supercall: ksu_handle_sys_reboot() susfs command entry (matches susfs 10_ command set).
-- selinux: sid helpers + susfs_set_batch_sid(); de-static selinux_hide internals; make the
-  setprocattr LSM hook best-effort (selinux_setprocattr is inlined on CodeLinaro 5.15).
-- kernel_umount: mark process umounted for susfs + kick deferred work.
-- renames: ksu_su_compat_enabled -> ksu_su_compat_toggle, ksu_handle_setresuid ->
-  ksu_handle_setresuid_transition (free names owned by susfs' kernel-side patch).
-- klog.h: CONFIG_KSU_SILENT_LOG compiles out all driver pr_* (no dmesg/bugreport trace).
+Adds susfs support to ApkeSU without disturbing its own hook layer. Notes:
+- feature/susfs_compat.c provides gate keys (disabled) + inert stubs for susfs' manual
+  hooks. ksu_handle_execveat_sucompat is intentionally NOT stubbed: ApkeSU defines its own
+  (feature/sucompat.c), stubbing it duplicates the symbol at LTO link. Its susfs manual-hook
+  call site is gated off (ksu_su_compat_enabled=false) and never runs.
+- Kbuild: build susfs_compat.o; resolve drivers/kernelsu symlink (cd -P) for in-tree includes.
+- Kconfig: CONFIG_KSU_SUSFS* + CONFIG_KSU_SILENT_LOG. supercall: ksu_handle_sys_reboot().
+- selinux: sid helpers + susfs_set_batch_sid(); de-static selinux_hide; setprocattr hook
+  best-effort (selinux_setprocattr inlined on CodeLinaro 5.15). kernel_umount susfs bridge.
+- renames: ksu_su_compat_enabled -> ksu_su_compat_toggle,
+  ksu_handle_setresuid -> ksu_handle_setresuid_transition.
+- klog.h: CONFIG_KSU_SILENT_LOG compiles out all driver pr_* (hidden build).
 
-Requires CONFIG_KSU=y (built-in): susfs kernel-side references KSU symbols from built-in code.
+Requires CONFIG_KSU=y (built-in).
 
 diff --git a/kernel/Kbuild b/kernel/Kbuild
 index 3ec23d0..d182903 100644
@@ -361,10 +360,10 @@ index 5e2cfe1..2893ea5 100644
  void ksu_sucompat_exit(void);
 diff --git a/kernel/feature/susfs_compat.c b/kernel/feature/susfs_compat.c
 new file mode 100644
-index 0000000..d90cdc6
+index 0000000..180fca1
 --- /dev/null
 +++ b/kernel/feature/susfs_compat.c
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,74 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * SUSFS compatibility layer for ApkeSU.
@@ -414,10 +413,12 @@ index 0000000..d90cdc6
 +    return 0;
 +}
 +
-+int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags)
-+{
-+    return 0;
-+}
++/*
++ * NOTE: ksu_handle_execveat_sucompat is intentionally NOT defined here.
++ * ApkeSU provides its own ksu_handle_execveat_sucompat() (feature/sucompat.c),
++ * so defining a stub would be a duplicate symbol at link time. susfs' manual-hook
++ * call site for it is gated off (ksu_su_compat_enabled = false) and never runs.
++ */
 +
 +/*
 + * setresuid: ApkeSU tracks uid transitions through its own hook
