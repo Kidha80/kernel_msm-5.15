@@ -58,6 +58,15 @@ on:
         options:
           - "no"
           - "yes"
+      dsKabiVariant:
+        description: "DroidSpaces SYSVIPC kABI slot variant (WRONG one can bootloop; 6_7_8 bricked this device before)"
+        required: true
+        type: choice
+        default: "1_2_3"
+        options:
+          - "1_2_3"
+          - "3_4_5"
+          - "6_7_8"
 
       tickRate:
         description: "Kernel tick rate (Hz)"
@@ -617,6 +626,48 @@ jobs:
           echo "--- KSU configs in defconfig ---"
           grep -E '^CONFIG_KSU' "$CONFIG_FILE"
           echo "🎉 ApkeSU with SUSFS fully integrated!"
+
+      - name: "🧩 Add DroidSpaces (LXC / containers) support"
+        working-directory: ./${{ env.kernelDir }}/${{ env.kernelName }}
+        run: |
+          set -euo pipefail
+          DS="${{ env.WORK_DIR }}/builder/patches/droidspaces"
+          VAR="${{ github.event.inputs.dsKabiVariant }}"
+          echo "🧩 DroidSpaces: applying (SYSVIPC kABI variant = $VAR)"
+
+          # USER_NS guard + ghost-task: safe on this tree (verified apply)
+          patch -p1 --no-backup-if-mismatch < "$DS/0001-Guard-USER_NS-for-non-root-users.patch"
+          patch -p1 --no-backup-if-mismatch < "$DS/0001-Return-ghost-task-if-task-is-null-and-is-requested-b.patch"
+
+          # SYSVIPC kABI padding: steals reserved task_struct slots. The WRONG variant
+          # applies textually but breaks the vendor ABI at runtime -> bootloop. On this
+          # CodeLinaro 5.15 tree 6_7_8 is known to brick (Xiaomi uses those slots).
+          patch -p1 --no-backup-if-mismatch < "$DS/fix_sysvipc_kabi_${VAR}.patch"
+
+          if find . -name '*.rej' | grep -q .; then
+            echo "::error::DroidSpaces patch left rejected hunks (wrong kABI variant for this tree?):"
+            find . -name '*.rej' -exec echo "=== {} ===" \; -exec cat {} \;
+            exit 1
+          fi
+
+          CONFIG_FILE="arch/arm64/configs/${{ env.DEFCONFIG_NAME }}"
+          cat >> "$CONFIG_FILE" << 'EOF'
+          CONFIG_SYSVIPC=y
+          CONFIG_POSIX_MQUEUE=y
+          CONFIG_IPC_NS=y
+          CONFIG_PID_NS=y
+          CONFIG_USER_NS=y
+          CONFIG_NAMESPACES=y
+          CONFIG_DEVTMPFS=y
+          CONFIG_DEVTMPFS_MOUNT=y
+          CONFIG_NETFILTER_XT_TARGET_REJECT=y
+          CONFIG_NETFILTER_XT_TARGET_LOG=y
+          CONFIG_NETFILTER_XT_MATCH_RECENT=y
+          EOF
+
+          echo "--- DroidSpaces / namespace configs ---"
+          grep -E '^CONFIG_(SYSVIPC|USER_NS|PID_NS|IPC_NS|POSIX_MQUEUE)' "$CONFIG_FILE" | sort -u
+          echo "✅ DroidSpaces (variant $VAR) applied"
 
       - name: "🔨 Build kernel"
         if: github.event.inputs.buildToolchains == 'android-tools'
